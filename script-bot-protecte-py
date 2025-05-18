@@ -1,0 +1,610 @@
+import discord # type: ignore
+from discord.ext import commands # type: ignore
+from collections import defaultdict
+from discord.ext.commands import has_permissions, CheckFailure # type: ignore
+import time
+import asyncio
+import re
+import json
+import os
+from datetime import timedelta, datetime
+
+SPAM_FILE = "spam_data.json"
+spam_data = {}
+muted_users = {}
+ADMIN_FILE = "admins.json"
+RAID_SPAM_USERS = defaultdict(list)  # guild_id: [(user_id, timestamp)]
+RAID_SPAM_THRESHOLD = 3  # Nombre d'utilisateurs différents qui spamment en même temps
+RAID_TIME_WINDOW = 5  # secondes
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.bans = True
+intents.message_content = True  # Très important pour lire le contenu des messages
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+actions = defaultdict(list)  # user_id: list of (timestamp, action_type, name, id)
+banned_users = set()  # Pour éviter les bans/reports multiples
+
+# Liste dynamique des IDs admins alertés
+ALERT_RECIPIENT_IDS = [
+    111111111111111111,  # Exemple d'ID admin par défaut (remplace par vrai)
+]
+
+THRESHOLDS = {
+    "channel_delete": 3,
+    "channel_create": 5,
+    "role_create": 5,
+    "role_delete": 5,
+}
+TIME_FRAME = 5  # secondes
+
+# Configuration pour la protection webhook
+WEBHOOK_SPAM_THRESHOLD = 5  # messages max dans TIME_FRAME avant action
+WEBHOOK_TIME_FRAME = 30  # secondes
+webhook_message_times = defaultdict(list)
+webhook_locks = defaultdict(asyncio.Lock)
+
+def clean_old_actions(user_id):
+    now = time.time()
+    actions[user_id] = [(t, a, name, eid) for t, a, name, eid in actions[user_id] if now - t < TIME_FRAME]
+
+async def sanction_user(guild, user_id):
+    if user_id in banned_users:
+        return  # Déjà banni, on sort
+    banned_users.add(user_id)
+    try:
+        await guild.ban(discord.Object(id=user_id), reason="Anti-Raid : activité suspecte", delete_message_seconds=0)
+    except Exception:
+        pass  # silence en cas d'erreur
+
+async def send_raid_report(guild, user_id):
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            member = None
+
+    name = member.name if member else f"Utilisateur ID {user_id}"
+    avatar_url = member.display_avatar.url if member else None
+
+    lines = []
+    for action in THRESHOLDS:
+        entries = [(n, eid, t) for t, a, n, eid in actions[user_id] if a == action]
+        if entries:
+            lines.append(f"**{action.replace('_', ' ').title()}** ({len(entries)}):")
+            for n, eid, tstamp in entries:
+                timestr = time.strftime('%H:%M:%S', time.localtime(tstamp))
+                lines.append(f"• `{n}` (`{eid}`) à {timestr}")
+            lines.append("")
+
+    description = "\n".join(lines) if lines else "*Aucune activité détectée*"
+
+    embed = discord.Embed(
+        title="🚨 Raid détecté",
+        color=discord.Color.red(),
+        description=description
+    )
+    embed.set_author(name=name, icon_url=avatar_url)
+    embed.set_footer(text=f"Serveur : {guild.name} | ID : {guild.id}")
+    embed.timestamp = discord.utils.utcnow()
+
+    for uid in ALERT_RECIPIENT_IDS:
+        try:
+            user = await bot.fetch_user(uid)
+            await user.send(embed=embed)
+        except Exception:
+            pass
+
+async def handle_action(guild, action_type, obj, audit_action):
+    try:
+        entry = await anext(guild.audit_logs(limit=1, action=audit_action))
+        user = entry.user
+        now = time.time()
+
+        actions[user.id].append((now, action_type, obj.name, obj.id))
+        clean_old_actions(user.id)
+
+        count = sum(1 for t, a, _, _ in actions[user.id] if a == action_type)
+
+        if count >= THRESHOLDS[action_type] and user.id not in banned_users:
+            await sanction_user(guild, user.id)
+            await send_raid_report(guild, user.id)
+
+    except StopAsyncIteration:
+        pass
+    except Exception:
+        pass
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    await handle_action(channel.guild, "channel_delete", channel, discord.AuditLogAction.channel_delete)
+
+@bot.event
+async def on_guild_channel_create(channel):
+    await handle_action(channel.guild, "channel_create", channel, discord.AuditLogAction.channel_create)
+
+@bot.event
+async def on_guild_role_create(role):
+    await handle_action(role.guild, "role_create", role, discord.AuditLogAction.role_create)
+
+@bot.event
+async def on_guild_role_delete(role):
+    await handle_action(role.guild, "role_delete", role, discord.AuditLogAction.role_delete)
+
+# Chargement initial
+def load_admins():
+    if os.path.exists(ADMIN_FILE):
+        with open(ADMIN_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("admins", [])
+    return []
+
+def save_admins(admin_ids):
+    with open(ADMIN_FILE, "w") as f:
+        json.dump({"admins": admin_ids}, f, indent=4)
+
+# Chargement dans la mémoire
+ALERT_RECIPIENT_IDS = load_admins()
+
+@bot.command(name="idadmin")
+@has_permissions(administrator=True)
+async def add_admin_id(ctx, new_id: int):
+    if new_id in ALERT_RECIPIENT_IDS:
+        await ctx.send(f"L'ID `{new_id}` est déjà dans la liste des administrateurs à alerter.")
+        return
+
+    ALERT_RECIPIENT_IDS.append(new_id)
+    save_admins(ALERT_RECIPIENT_IDS)
+
+    await ctx.send(f"✅ ID `{new_id}` ajouté à la liste des administrateurs à alerter.")
+
+    try:
+        user = await bot.fetch_user(new_id)
+        embed = discord.Embed(
+            title="🚨 Vous avez été ajouté comme administrateur d'alerte",
+            description=(
+                f"Vous avez été ajouté à la liste des administrateurs recevant les rapports de raid "
+                f"sur le serveur **{ctx.guild.name}**."
+            ),
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Merci de rester vigilant !")
+        await user.send(embed=embed)
+    except Exception:
+        pass
+
+@add_admin_id.error
+async def add_admin_id_error(ctx, error):
+    if isinstance(error, CheckFailure):
+        reply = await ctx.message.reply("❌ Vous ne pouvez pas utiliser cette commande.")
+        await asyncio.sleep(300)
+        try:
+            await reply.delete()
+        except Exception:
+            pass
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ ID invalide, merci d'entrer un nombre valide.")
+    else:
+        await ctx.send("❌ Une erreur est survenue lors de l'exécution de la commande.")
+
+async def send_webhook_alert(old_webhook_url, new_webhook_url, guild_name):
+    embed = discord.Embed(
+        title="🚨 Webhook compromis détecté",
+        color=discord.Color.red(),
+        description=(
+            f"Un webhook a été détecté comme compromis et a été remplacé sur le serveur **{guild_name}**.\n\n"
+            f"**Webhook supprimé** : {old_webhook_url}\n"
+            f"**Webhook créé** : {new_webhook_url if new_webhook_url else 'Erreur lors de la recréation'}"
+        )
+    )
+    embed.timestamp = discord.utils.utcnow()
+    for admin_id in ALERT_RECIPIENT_IDS:
+        try:
+            user = await bot.fetch_user(admin_id)
+            await user.send(embed=embed)
+        except Exception as e:
+            print(f"Erreur lors de l'envoi d'alerte à {admin_id}: {e}")
+
+# Décorateur personnalisé pour vérifier si l'auteur est admin
+def is_admin():
+    async def predicate(ctx):
+        return ctx.author.id in ALERT_RECIPIENT_IDS
+    return commands.check(predicate)
+
+# Fonction utilitaire pour parser une durée de type '10m', '2h', etc.
+def parse_duration(duration_str):
+    match = re.match(r'^(\d+)([smhd])$', duration_str)
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2)
+    if unit == 's':
+        return timedelta(seconds=value)
+    elif unit == 'm':
+        return timedelta(minutes=value)
+    elif unit == 'h':
+        return timedelta(hours=value)
+    elif unit == 'd':
+        return timedelta(days=value)
+    return None
+
+def load_spam_data():
+    global spam_data
+    try:
+        with open(SPAM_FILE, "r") as f:
+            spam_data = json.load(f)
+            # Correction des clés pour assurer que ce sont des chaînes
+            corrected_spam_data = {}
+            for guild_id, guild_data in spam_data.items():
+                corrected_guild_data = {}
+                for user_id, count in guild_data.items():
+                    corrected_guild_data[str(user_id)] = count
+                corrected_spam_data[str(guild_id)] = corrected_guild_data
+            spam_data = corrected_spam_data
+    except (FileNotFoundError, json.JSONDecodeError):
+        spam_data = {}
+    print(f"Données de spam chargées: {len(spam_data)} serveurs")
+
+def save_spam_data():
+    try:
+        with open(SPAM_FILE, "w") as f:
+            json.dump(spam_data, f, indent=4)
+    except Exception as e:
+        print(f"Erreur lors de la sauvegarde des données de spam: {e}")
+
+async def mute_member(member: discord.Member, duration: timedelta, reason: str = "Spam détecté"):
+    until = discord.utils.utcnow() + duration
+    try:
+        # Vérifier si l'utilisateur existe déjà dans le dictionnaire des utilisateurs mute
+        author_id = str(member.id)
+        # S'il est déjà mute, ne refait pas de timeout sauf si la nouvelle durée est plus longue
+        if author_id in muted_users:
+            existing_end_time = muted_users[author_id]
+            if until.timestamp() <= existing_end_time:
+                print(f"L'utilisateur {member.id} est déjà mute avec une durée égale ou plus longue, on ignore.")
+                return
+        
+        # Appliquer le timeout
+        await member.timeout(until, reason=reason)
+        # Mettre à jour le dictionnaire
+        muted_users[author_id] = until.timestamp()
+        print(f"Utilisateur {member.id} mute jusqu'à {until.isoformat()}")
+    except Exception as e:
+        print(f"Erreur lors du mute de {member.id}: {e}")
+
+@bot.event
+async def on_ready():
+    print(f"{bot.user} est prêt.")
+    load_spam_data()
+    # Charger les admins à chaque démarrage du bot
+    global ALERT_RECIPIENT_IDS
+    ALERT_RECIPIENT_IDS = load_admins()
+    if not ALERT_RECIPIENT_IDS:
+        print("⚠️ Attention: Aucun admin configuré pour recevoir les alertes!")
+    else:
+        print(f"✅ {len(ALERT_RECIPIENT_IDS)} admins configurés pour recevoir les alertes.")
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    
+    # Partie 1: Protection webhook
+    if message.webhook_id:
+        webhook_id = message.webhook_id
+        now = time.time()
+        
+        # Ajout du timestamp au webhook
+        webhook_message_times[webhook_id].append(now)
+        
+        # Nettoyage des anciens messages
+        webhook_message_times[webhook_id] = [t for t in webhook_message_times[webhook_id] if now - t <= WEBHOOK_TIME_FRAME]
+        
+        # Vérification si le seuil est dépassé
+        if len(webhook_message_times[webhook_id]) >= WEBHOOK_SPAM_THRESHOLD:
+            # Utiliser un lock pour éviter les traitements parallèles du même webhook
+            async with webhook_locks[webhook_id]:
+                # Revérifier pour éviter les doublons après acquisition du lock
+                if webhook_id not in webhook_message_times or len(webhook_message_times[webhook_id]) < WEBHOOK_SPAM_THRESHOLD:
+                    return
+                
+                # Nettoyer avant le traitement pour éviter doubles appels
+                webhook_times = webhook_message_times.pop(webhook_id, [])
+                
+                # On s'assure qu'on a bien un guild
+                guild = message.guild
+                if not guild:
+                    return
+                
+                # Recherche du webhook
+                try:
+                    webhooks = await guild.webhooks()
+                    webhook_obj = next((wh for wh in webhooks if wh.id == webhook_id), None)
+                    
+                    if webhook_obj is None:
+                        print(f"Webhook {webhook_id} introuvable")
+                        return
+                    
+                    old_webhook_url = webhook_obj.url
+                    webhook_channel = webhook_obj.channel
+                    webhook_name = webhook_obj.name
+                    
+                    print(f"Webhook spam détecté: {webhook_name} ({webhook_id}) - {len(webhook_times)} messages en {WEBHOOK_TIME_FRAME}s")
+                    
+                    # Supprimer immédiatement le webhook
+                    try:
+                        await webhook_obj.delete(reason="Webhook compromis détecté, suppression immédiate")
+                        print(f"Webhook {webhook_id} supprimé avec succès")
+                    except Exception as e:
+                        print(f"Erreur lors de la suppression du webhook {webhook_id}: {e}")
+                    
+                    # Supprimer les messages récents du webhook
+                    time_limit = now - WEBHOOK_TIME_FRAME
+                    try:
+                        deleted_count = 0
+                        async for m in webhook_channel.history(limit=100):
+                            if m.webhook_id == webhook_id and m.created_at.timestamp() >= time_limit:
+                                try:
+                                    await m.delete()
+                                    deleted_count += 1
+                                except Exception:
+                                    pass
+                        print(f"Supprimé {deleted_count} messages du webhook {webhook_id}")
+                    except Exception as e:
+                        print(f"Erreur lors de la suppression des messages du webhook {webhook_id}: {e}")
+                    
+                    # Recréer le webhook avec le même nom
+                    new_webhook = None
+                    try:
+                        new_webhook = await webhook_channel.create_webhook(
+                            name=webhook_name,
+                            reason="Recréation automatique d'un webhook compromis"
+                        )
+                        print(f"Nouveau webhook créé: {new_webhook.id}")
+                    except Exception as e:
+                        print(f"Erreur lors de la recréation du webhook: {e}")
+                    
+                    new_webhook_url = new_webhook.url if new_webhook else None
+                    
+                    # Envoyer l'alerte
+                    await send_webhook_alert(old_webhook_url, new_webhook_url, guild.name)
+                
+                except Exception as e:
+                    print(f"Erreur globale dans la gestion du webhook {webhook_id}: {e}")
+    
+    # Partie 2: Détection de spam
+    if not message.author.bot:
+        author_id = str(message.author.id)
+        now_ts = datetime.utcnow().timestamp()
+        
+        # Ignorer si l'utilisateur est déjà mute
+        if author_id in muted_users and now_ts < muted_users[author_id]:
+            return
+        elif author_id in muted_users:
+            # Le mute est expiré, on le supprime
+            del muted_users[author_id]
+        
+        # Détection simple: 5 messages en 5 secondes
+        if not hasattr(bot, "message_cache"):
+            bot.message_cache = {}
+        
+        # Ajout d'un système de verrou pour éviter les races conditions
+        if not hasattr(bot, "spam_locks"):
+            bot.spam_locks = defaultdict(asyncio.Lock)
+        
+        user_msgs = bot.message_cache.get(author_id, [])
+        user_msgs = [t for t in user_msgs if now_ts - t < 5]
+        user_msgs.append(now_ts)
+        bot.message_cache[author_id] = user_msgs
+        
+        # Vérifier si le seuil de spam est atteint
+        if len(user_msgs) >= 5:
+            # Utiliser un verrou pour éviter les sanctions multiples simultanées
+            async with bot.spam_locks[author_id]:
+                # On doit revérifier la condition après acquisition du verrou
+                if author_id in muted_users and now_ts < muted_users[author_id]:
+                    return  # L'utilisateur a été mute entre-temps
+                
+                if message.guild:
+                    guild_id = str(message.guild.id)
+                    
+                    # Chargement ou initialisation des données de spam
+                    if guild_id not in spam_data:
+                        spam_data[guild_id] = {}
+                    
+                    if author_id not in spam_data[guild_id]:
+                        spam_data[guild_id][author_id] = 0
+                    
+                    # On incrémente le compteur de spam et on détermine la durée
+                    spam_data[guild_id][author_id] += 1
+                    count = spam_data[guild_id][author_id]
+                    
+                    # Sauvegarde immédiate pour empêcher les compteurs de se désynchroniser
+                    save_spam_data()
+                    
+                    # Détermination de la durée selon le nombre d'infractions
+                    if count == 1:
+                        duration = timedelta(minutes=2)
+                    elif count == 2:
+                        duration = timedelta(minutes=5)
+                    elif count == 3:
+                        duration = timedelta(minutes=15)
+                    else:
+                        duration = timedelta(hours=1)
+                    
+                    # Application du mute
+                    guild_id = str(message.guild.id)
+                    RAID_SPAM_USERS[guild_id].append((message.author.id, now_ts))
+
+                    # Nettoyage des anciens spammeurs (hors fenêtre de 5s)
+                    RAID_SPAM_USERS[guild_id] = [(uid, ts) for uid, ts in RAID_SPAM_USERS[guild_id] if now_ts - ts < RAID_TIME_WINDOW]
+
+                    # Extraction des spammeurs uniques
+                    unique_users = set(uid for uid, _ in RAID_SPAM_USERS[guild_id])
+
+                    if len(unique_users) >= RAID_SPAM_THRESHOLD:
+                        banned = []
+                        for uid in unique_users:
+                            try:
+                                member = message.guild.get_member(uid)
+                                if member:
+                                    await message.guild.ban(member, reason="Raid détecté : spam coordonné")
+                                    banned.append((member.name, member.id))
+                            except Exception as e:
+                                print(f"Erreur lors du bannissement de {uid}: {e}")
+                        
+                        # Vider la liste après traitement
+                        RAID_SPAM_USERS[guild_id] = []
+
+                        # Envoyer un embed d'alerte aux admins
+                        if banned:
+                            embed = discord.Embed(
+                                title="🚨 Raid bloqué par anti-raid",
+                                description="3 comptes ou plus ont spammé en même temps. Ils ont été **bannis automatiquement**.",
+                               color=discord.Color.red()
+                            )
+                            for name, uid in banned:
+                                embed.add_field(name=name, value=f"ID: `{uid}`", inline=False)
+                            embed.set_footer(text=f"Serveur : {message.guild.name}")
+                            embed.timestamp = discord.utils.utcnow()
+                    
+                            for admin_id in ALERT_RECIPIENT_IDS:
+                                try:
+                                    user = await bot.fetch_user(admin_id)
+                                    await user.send(embed=embed)
+                                except Exception:
+                                    pass
+                    else:
+                        # Cas normal : mute pour spam
+                        await mute_member(message.author, duration)
+                    
+                    # Notification dans le canal
+                    try:
+                        await message.channel.send(
+                            f"🔇 {message.author.mention} a été mute pour spam ({duration.total_seconds()/60:.0f} minutes). "
+                            f"Infraction #{count}."
+                        )
+                    except Exception as e:
+                        print(f"Erreur lors de l'envoi du message de mute: {e}")
+                    
+                    # On vide le cache messages pour cet utilisateur
+                    bot.message_cache[author_id] = []
+    
+    # Ne pas oublier de traiter les commandes!
+    await bot.process_commands(message)
+
+@bot.command()
+@is_admin()
+async def ban(ctx, user_id: int, *, reason: str = "Aucune raison fournie."):
+    user = ctx.guild.get_member(user_id) or await bot.fetch_user(user_id)
+
+    embed = discord.Embed(
+        title="🚫 Vous avez été banni",
+        description=f"Raison : **{reason}**\nServeur : **{ctx.guild.name}**",
+        color=discord.Color.red()
+    )
+    try:
+        await user.send(embed=embed)
+    except Exception:
+        pass
+
+    try:
+        await ctx.guild.ban(user, reason=reason)
+        await ctx.send(f"✅ {user.mention} a été **banni**.")
+    except Exception as e:
+        await ctx.send(f"❌ Erreur lors du ban : {e}")
+
+@bot.command()
+@is_admin()
+async def kick(ctx, user_id: int, *, reason="Aucune raison fournie."):
+    member = ctx.guild.get_member(user_id)
+    if not member:
+        await ctx.send("❌ Membre introuvable sur le serveur.")
+        return
+
+    embed = discord.Embed(
+        title="👢 Vous avez été kick du serveur",
+        description=f"Raison : **{reason}**\nServeur : **{ctx.guild.name}**",
+        color=discord.Color.orange()
+    )
+    try:
+        await member.send(embed=embed)
+    except Exception:
+        pass
+
+    try:
+        await member.kick(reason=reason)
+        await ctx.send(f"✅ {member.mention} a été **kick**.")
+    except Exception as e:
+        await ctx.send(f"❌ Erreur lors du kick : {e}")
+
+@bot.command()
+@is_admin()
+async def mute(ctx, user_id: int, duration: str = "10m"):
+    member = ctx.guild.get_member(user_id)
+    if not member:
+        await ctx.send("❌ Membre introuvable sur le serveur.")
+        return
+
+    delta = parse_duration(duration)
+    if not delta:
+        await ctx.send("⏳ Format de durée invalide. Utilise : `15s`, `10m`, `2h`, `1d`.")
+        return
+
+    if delta > timedelta(days=28):
+        await ctx.send("⏳ Durée trop longue. Max : 28 jours.")
+        return
+
+    try:
+        until = discord.utils.utcnow() + delta
+        await member.timeout(until)
+        # Si tu utilises un dict pour suivre les mutés, ajoute-le ici :
+        muted_users[str(user_id)] = until.timestamp()
+        await ctx.send(f"🔇 {member} a été **mute** pour `{duration}`.")
+    except Exception as e:
+        await ctx.send(f"❌ Erreur lors du mute : {e}")
+
+@bot.command()
+@is_admin()
+async def unmute(ctx, user_id: int):
+    member = ctx.guild.get_member(user_id)
+    if not member:
+        await ctx.send("❌ Membre introuvable sur le serveur.")
+        return
+    try:
+        await member.timeout(None)
+        muted_users.pop(str(user_id), None)
+        await ctx.send(f"🔊 {member} a été **unmute**.")
+    except Exception as e:
+        await ctx.send(f"❌ Erreur lors du unmute : {e}")
+
+@bot.command()
+@is_admin()
+async def unban(ctx, user_id: int):
+    user = await bot.fetch_user(user_id)
+    try:
+        await ctx.guild.unban(user)
+        await ctx.send(f"✅ {user} a été **unban**.")
+    except Exception as e:
+        await ctx.send(f"❌ Erreur lors du unban : {e}")
+
+@bot.command()
+@is_admin()
+async def reload_admins(ctx):
+    global ALERT_RECIPIENT_IDS
+    ALERT_RECIPIENT_IDS = load_admins()
+    await ctx.send("✅ Liste des admins rechargée.")
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        msg = await ctx.send(f"❌ {ctx.author.mention} Tu n'as pas la permission d'utiliser cette commande.")
+        await msg.delete(delay=5)
+    else:
+        raise error
+
+# ⚠️ ATTENTION: Ne pas oublier de changer le token avant d'utiliser en production
+bot.run('VOTRE_TOKEN_BOT')  # Remplacez par votre vrai token
